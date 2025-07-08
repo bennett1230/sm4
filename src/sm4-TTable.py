@@ -1,11 +1,10 @@
 import time
 
-class SM4:
+class SM4_TTable:
     """
-    SM4加密算法基础实现（可交互版本）
+    SM4加密算法T-Table优化实现（带计时）
     """
 
-    # S盒
     S_BOX = [
         0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
         0x2b, 0x67, 0x9a, 0x76, 0x2a, 0xbe, 0x04, 0xc3, 0xaa, 0x44, 0x13, 0x26, 0x49, 0x86, 0x06, 0x99,
@@ -25,10 +24,8 @@ class SM4:
         0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f, 0x3e, 0xd7, 0xcb, 0x39, 0x48
     ]
 
-    # 系统参数FK
     FK = [0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc]
 
-    # 固定参数CK
     CK = [
         0x00070e15, 0x1c232a31, 0x383f464d, 0x545b6269,
         0x70777e85, 0x8c939aa1, 0xa8afb6bd, 0xc4cbd2d9,
@@ -42,120 +39,85 @@ class SM4:
 
     def __init__(self, key):
         if len(key) != 16:
-            raise ValueError("SM4 密钥必须是 16 bytes (128 bits) 长")
+            raise ValueError("密钥必须为16字节")
+        self._build_tables()
         self.rk = self._expand_key(key)
+
+    def _build_tables(self):
+        self.T = [[0] * 256 for _ in range(4)]
+        for i in range(256):
+            s = self.S_BOX[i]
+            for j in range(4):
+                val = s << (24 - 8 * j)
+                l_val = val ^ self._rotl(val, 2) ^ self._rotl(val, 10) ^ self._rotl(val, 18) ^ self._rotl(val, 24)
+                self.T[j][i] = l_val
 
     @staticmethod
     def _rotl(x, n):
-        """循环左移"""
         return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
 
-    @staticmethod
-    def _tau(a):
-        """非线性变换τ(.)"""
-        a0 = (a >> 24) & 0xFF
-        a1 = (a >> 16) & 0xFF
-        a2 = (a >> 8) & 0xFF
-        a3 = a & 0xFF
-
-        b0 = SM4.S_BOX[a0]
-        b1 = SM4.S_BOX[a1]
-        b2 = SM4.S_BOX[a2]
-        b3 = SM4.S_BOX[a3]
-
-        return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-
-    def _l(self, b):
-        """线性变换L"""
-        return b ^ self._rotl(b, 2) ^ self._rotl(b, 10) ^ self._rotl(b, 18) ^ self._rotl(b, 24)
-
-    def _l_prime(self, b):
-        """线性变换L'"""
-        return b ^ self._rotl(b, 13) ^ self._rotl(b, 23)
+    def _tau(self, a):
+        return (self.S_BOX[(a >> 24) & 0xFF] << 24 |
+                self.S_BOX[(a >> 16) & 0xFF] << 16 |
+                self.S_BOX[(a >> 8) & 0xFF] << 8 |
+                self.S_BOX[a & 0xFF])
 
     def _t(self, x):
-        """合成变换T"""
-        return self._l(self._tau(x))
+        return (self.T[0][(x >> 24) & 0xFF] ^
+                self.T[1][(x >> 16) & 0xFF] ^
+                self.T[2][(x >> 8) & 0xFF] ^
+                self.T[3][x & 0xFF])
 
     def _t_prime(self, x):
-        """合成变换T'"""
-        return self._l_prime(self._tau(x))
+        s = self._tau(x)
+        return s ^ self._rotl(s, 13) ^ self._rotl(s, 23)
 
     def _expand_key(self, key):
-        """密钥扩展算法"""
-        # 将密钥转换为4个字
-        mk = [0] * 4
-        for i in range(4):
-            mk[i] = (key[4 * i] << 24) | (key[4 * i + 1] << 16) | (key[4 * i + 2] << 8) | key[4 * i + 3]
-
-        # 生成中间密钥K
-        k = [0] * 36
-        for i in range(4):
-            k[i] = mk[i] ^ SM4.FK[i]
-
-        # 生成轮密钥rk
-        rk = [0] * 32
+        mk = [int.from_bytes(key[i:i + 4], 'big') for i in range(0, 16, 4)]
+        k = [mk[i] ^ self.FK[i] for i in range(4)]
+        rk = []
         for i in range(32):
-            k[i + 4] = k[i] ^ self._t_prime(k[i + 1] ^ k[i + 2] ^ k[i + 3] ^ SM4.CK[i])
-            rk[i] = k[i + 4]
-
+            tmp = k[i + 1] ^ k[i + 2] ^ k[i + 3] ^ self.CK[i]
+            k.append(k[i] ^ self._t_prime(tmp))
+            rk.append(k[-1])
         return rk
 
-    def _f(self, x0, x1, x2, x3, rk):
-        """轮函数F"""
-        return x0 ^ self._t(x1 ^ x2 ^ x3 ^ rk)
+    def _crypt(self, data, decrypt=False):
+        start_time = time.perf_counter()
 
-    def _crypt(self, input_data, decrypt=False):
-        """加/解密函数（添加计时）"""
-        if len(input_data) != 16:
-            raise ValueError("SM4 block size must be 16 bytes (128 bits)")
-
-        start_time = time.perf_counter()  # 开始计时
-
-        # 将输入数据转换为4个字
-        x = [0] * 36
-        for i in range(4):
-            x[i] = (input_data[4 * i] << 24) | (input_data[4 * i + 1] << 16) | (input_data[4 * i + 2] << 8) | \
-                   input_data[4 * i + 3]
-
-        # 32轮迭代
-        rk = self.rk
-        if decrypt:
-            rk = rk[::-1]  # 解密时使用逆序轮密钥
+        x = [int.from_bytes(data[i:i + 4], 'big') for i in range(0, 16, 4)]
+        rk = self.rk[::-1] if decrypt else self.rk
 
         for i in range(32):
-            x[i + 4] = self._f(x[i], x[i + 1], x[i + 2], x[i + 3], rk[i])
+            x.append(self._f(x[i], x[i + 1], x[i + 2], x[i + 3], rk[i]))
 
-        # 反序变换
-        output = bytearray(16)
-        for i in range(4):
-            output[4 * i] = (x[35 - i] >> 24) & 0xFF
-            output[4 * i + 1] = (x[35 - i] >> 16) & 0xFF
-            output[4 * i + 2] = (x[35 - i] >> 8) & 0xFF
-            output[4 * i + 3] = x[35 - i] & 0xFF
+        result = b''.join((x[35 - i]).to_bytes(4, 'big') for i in range(4))
 
-        elapsed = (time.perf_counter() - start_time) * 1000  # 毫秒
-        self.last_operation_time = elapsed
+        self.last_operation_time = (time.perf_counter() - start_time) * 1000  # 毫秒
+        return result
 
-        return bytes(output)
+    def _f(self, x0, x1, x2, x3, rk):
+        return x0 ^ self._t(x1 ^ x2 ^ x3 ^ rk)
 
     def encrypt(self, plaintext):
-        """加密"""
-        return self._crypt(plaintext, decrypt=False)
+        start = time.perf_counter()
+        result = self._crypt(plaintext)
+        self.total_encrypt_time = (time.perf_counter() - start) * 1000
+        return result
 
     def decrypt(self, ciphertext):
-        """解密"""
-        return self._crypt(ciphertext, decrypt=True)
+        start = time.perf_counter()
+        result = self._crypt(ciphertext, True)
+        self.total_decrypt_time = (time.perf_counter() - start) * 1000
+        return result
 
 
 def interactive_demo():
-    """交互式演示函数"""
     print("SM4加密算法交互演示")
     print("=" * 40)
 
-    # 输入密钥
     while True:
-        key_hex = input("请输入16字节(32字符)的16进制密钥(例如:0123456789abcdeffedcba9876543210): ").strip()
+        key_hex = input("请输入16字节(32字符)的16进制密钥: ").strip()
         try:
             if len(key_hex) != 32:
                 raise ValueError("密钥长度必须为32个16进制字符")
@@ -164,9 +126,8 @@ def interactive_demo():
         except ValueError as e:
             print(f"无效输入: {e}")
 
-    sm4 = SM4(key)
+    sm4 = SM4_TTable(key)
 
-    # 选择模式
     while True:
         print("\n请选择操作:")
         print("1. 加密")
@@ -177,12 +138,10 @@ def interactive_demo():
         if choice == '3':
             print("退出程序。")
             break
-
         if choice not in ('1', '2'):
             print("无效选择，请重新输入")
             continue
 
-        # 输入数据
         while True:
             data_hex = input("请输入16字节(32字符)的16进制数据: ").strip()
             try:
@@ -193,21 +152,17 @@ def interactive_demo():
             except ValueError as e:
                 print(f"无效输入: {e}")
 
-        # 执行操作
-        start_time = time.perf_counter()
         if choice == '1':
             result = sm4.encrypt(data)
-            operation = "加密"
+            print(f"\n加密结果: {result.hex()}")
+            print(f"内部方法耗时: {sm4.last_operation_time:.6f} 毫秒")
+            print(f"总操作耗时: {sm4.total_encrypt_time:.6f} 毫秒")
         else:
             result = sm4.decrypt(data)
-            operation = "解密"
-        elapsed = (time.perf_counter() - start_time) * 1000  # 毫秒
+            print(f"\n解密结果: {result.hex()}")
+            print(f"内部方法耗时: {sm4.last_operation_time:.6f} 毫秒")
+            print(f"总操作耗时: {sm4.total_decrypt_time:.6f} 毫秒")
 
-        print(f"\n{operation}结果: {result.hex()}")
-        print(f"内部方法耗时: {sm4.last_operation_time:.6f} 毫秒")
-        print(f"总操作耗时: {elapsed:.6f} 毫秒")
-
-        # 显示详细信息
         print("\n详细信息:")
         print(f"密钥: {key.hex()}")
         print(f"输入: {data.hex()}")
